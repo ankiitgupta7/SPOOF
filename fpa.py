@@ -1,5 +1,7 @@
 import os
+import json
 import random
+import time
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -9,24 +11,21 @@ import timm
 from tqdm import tqdm
 import urllib.request
 import pandas as pd
-import matplotlib.pyplot as plt
 
 # === CONFIG ===
 IMAGE_FOLDER = 'sampled_1000_images_from5000'
-SAMPLE_SIZE = 1
+SAMPLE_SIZE = 3
 MAX_ITER = 10000
-CSV_LOG = 'attack_log.csv'
-OUTPUT_IMG_FOLDER = 'attack_images'
-os.makedirs(OUTPUT_IMG_FOLDER, exist_ok=True)
-
 SEED = 42
+DATA_DIR = 'data_collected'
+
 random.seed(SEED)
 torch.manual_seed(SEED)
 
 MODEL_CONFIGS = [
     ('ResNet-50', lambda: timm.create_model('resnet50', pretrained=True)),
     ('VGG16', lambda: tv_models.vgg16(pretrained=True)),
-    ('ViT-B/16', lambda: timm.create_model('vit_base_patch16_224', pretrained=True))
+    ('ViT-B_16', lambda: timm.create_model('vit_base_patch16_224', pretrained=True))
 ]
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -43,12 +42,17 @@ transform = T.Compose([
                 std=[0.229, 0.224, 0.225])
 ])
 
-# === ONE-PIXEL ATTACK WITH LOGGING ===
-def one_pixel_attack_until_flipped(img_tensor, target_idx, model, max_iter=1000):
+# === ATTACK FUNCTION ===
+def one_pixel_attack_until_flipped(img_tensor, target_idx, model, max_iter):
     img = img_tensor.clone().detach()
     _, c, h, w = img.shape
-    class_conf_log = {}
-    for i in range(max_iter):
+    log_rows = []
+    success_gen = None
+    adv_at_success = None
+    start_time = time.time()
+
+    pbar = tqdm(range(max_iter), desc=" Generations", leave=False, dynamic_ncols=True)
+    for i in pbar:
         candidate = img.clone()
         x, y = random.randint(0, w - 1), random.randint(0, h - 1)
         ch = random.randint(0, 2)
@@ -56,47 +60,72 @@ def one_pixel_attack_until_flipped(img_tensor, target_idx, model, max_iter=1000)
 
         with torch.no_grad():
             probs = F.softmax(model(candidate), dim=1)
-            top_probs, top_idxs = probs.topk(3)
-            top_probs = top_probs.squeeze(0)
-            top_idxs = top_idxs.squeeze(0)
+            top_probs, top_idxs = probs.topk(5)
+            top_probs = top_probs.squeeze(0).tolist()
+            top_idxs = top_idxs.squeeze(0).tolist()
 
-        for idx, prob in zip(top_idxs.tolist(), top_probs.tolist()):
-            if idx not in class_conf_log:
-                class_conf_log[idx] = []
-            class_conf_log[idx].append((i, prob))
+        l2 = torch.norm((candidate - img_tensor)).item()
+        nnr = torch.norm((candidate - img_tensor).view(-1)).item()
+        flipped = top_idxs[0] != target_idx
 
-        if top_idxs[0].item() != target_idx:
-            return candidate, top_idxs.tolist(), top_probs.tolist(), True, class_conf_log
+        if flipped and success_gen is None:
+            success_gen = i
+            adv_at_success = candidate.clone()
+
+        log_rows.append({
+            "iter": i,
+            "true_label_idx": target_idx,
+            "true_label_name": imagenet_classes[target_idx],
+            "pred_1_idx": top_idxs[0],
+            "pred_1_name": imagenet_classes[top_idxs[0]],
+            "pred_1_conf": top_probs[0],
+            "pred_2_idx": top_idxs[1],
+            "pred_2_name": imagenet_classes[top_idxs[1]],
+            "pred_2_conf": top_probs[1],
+            "pred_3_idx": top_idxs[2],
+            "pred_3_name": imagenet_classes[top_idxs[2]],
+            "pred_3_conf": top_probs[2],
+            "pred_4_idx": top_idxs[3],
+            "pred_4_name": imagenet_classes[top_idxs[3]],
+            "pred_4_conf": top_probs[3],
+            "pred_5_idx": top_idxs[4],
+            "pred_5_name": imagenet_classes[top_idxs[4]],
+            "pred_5_conf": top_probs[4],
+            "l2": l2,
+            "nnr": nnr,
+            "flipped": flipped
+        })
 
         orig_conf = F.softmax(model(img), dim=1)[0, target_idx]
         new_conf = probs[0, target_idx]
         if new_conf < orig_conf:
             img = candidate
 
-    final_probs, final_idxs = F.softmax(model(img), dim=1).topk(3)
-    return img, final_idxs.squeeze(0).tolist(), final_probs.squeeze(0).tolist(), False, class_conf_log
+    time_taken = time.time() - start_time
+    final_probs, final_idxs = F.softmax(model(img), dim=1).topk(5)
+    return {
+        "final_tensor": img,
+        "final_probs": final_probs.squeeze(0).tolist(),
+        "final_idxs": final_idxs.squeeze(0).tolist(),
+        "log": log_rows,
+        "success": success_gen is not None,
+        "success_gen": success_gen,
+        "adv_at_success": adv_at_success,
+        "time_taken": time_taken
+    }
 
-# === GET TOP-K PREDICTIONS ===
-def get_topk(model, img_tensor, k=5):
-    with torch.no_grad():
-        output = model(img_tensor)
-        probs = F.softmax(output, dim=1)
-        topk_probs, topk_idxs = probs.topk(k)
-    return topk_probs.squeeze(0).tolist(), topk_idxs.squeeze(0).tolist()
-
-# === SAVE ORIGINAL & ADVERSARIAL IMAGES ===
-def save_images(original, adversarial, save_prefix):
+# === UTILS ===
+def save_images(original, adv, out_dir, tag):
     to_pil = T.ToPILImage()
     unnormalize = T.Normalize(
-        mean=[-m / s for m, s in zip([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])],
-        std=[1 / s for s in [0.229, 0.224, 0.225]]
+        mean=[-m/s for m, s in zip([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])],
+        std=[1/s for s in [0.229, 0.224, 0.225]]
     )
-    orig_img = to_pil(unnormalize(original.squeeze().cpu()))
-    adv_img = to_pil(unnormalize(adversarial.squeeze().cpu()))
-    orig_img.save(os.path.join(OUTPUT_IMG_FOLDER, f"{save_prefix}_original.png"))
-    adv_img.save(os.path.join(OUTPUT_IMG_FOLDER, f"{save_prefix}_adversarial.png"))
+    img = lambda x: to_pil(unnormalize(x.squeeze().cpu()))
+    img(original).save(os.path.join(out_dir, f"{tag}_original.png"))
+    img(adv).save(os.path.join(out_dir, f"{tag}_final.png"))
 
-# === LOAD MODELS ONCE ===
+# === LOAD MODELS ===
 print("Loading models...")
 loaded_models = {}
 for model_name, model_fn in MODEL_CONFIGS:
@@ -104,60 +133,91 @@ for model_name, model_fn in MODEL_CONFIGS:
     model.eval()
     loaded_models[model_name] = model
 
-# === SELECT RANDOM IMAGES ===
+# === SELECT IMAGES ===
 image_paths = [os.path.join(IMAGE_FOLDER, f) for f in os.listdir(IMAGE_FOLDER)
                if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
 random.shuffle(image_paths)
 image_paths = image_paths[:SAMPLE_SIZE]
 
-log_rows = []
+# === MAIN LOOP ===
 outer_pbar = tqdm(total=len(image_paths) * len(loaded_models), desc="Processing", dynamic_ncols=True)
-
-for img_path in image_paths:
+for sample_idx, img_path in enumerate(image_paths):
+    image_id = os.path.splitext(os.path.basename(img_path))[0]
     try:
         image = Image.open(img_path).convert('RGB')
         img_tensor = transform(image).unsqueeze(0).to(device)
     except (UnidentifiedImageError, OSError):
+        print(f"Skipping image: {img_path}")
         continue
 
     for model_name, model in loaded_models.items():
         try:
-            orig_probs, orig_idxs = get_topk(model, img_tensor, k=5)
-            orig_top1_idx = orig_idxs[0]
-            orig_top1_label = imagenet_classes[orig_top1_idx]
-            orig_top1_conf = orig_probs[0]
+            with torch.no_grad():
+                output = model(img_tensor)
+                probs = F.softmax(output, dim=1)
+                top_probs, top_idxs = probs.topk(5)
+                top_probs = top_probs.squeeze(0).tolist()
+                top_idxs = top_idxs.squeeze(0).tolist()
 
-            adv_tensor, adv_idxs, adv_probs, flipped, class_log = one_pixel_attack_until_flipped(
-                img_tensor, target_idx=orig_top1_idx, model=model, max_iter=MAX_ITER)
+            target_idx = top_idxs[0]
+            target_label = imagenet_classes[target_idx]
+            target_conf = top_probs[0]
 
-            save_prefix = f"{os.path.splitext(os.path.basename(img_path))[0]}_{model_name.replace('/', '_')}"
-            save_images(img_tensor, adv_tensor, save_prefix)
+            result = one_pixel_attack_until_flipped(
+                img_tensor, target_idx=target_idx, model=model, max_iter=MAX_ITER)
 
-            row = {
-                'image_path': img_path,
-                'model': model_name,
-                'orig_class_idx': orig_top1_idx,
-                'orig_class_label': orig_top1_label,
-                'orig_confidence': orig_top1_conf,
-                'adv_class_idx': adv_idxs[0],
-                'adv_class_label': imagenet_classes[adv_idxs[0]],
-                'adv_confidence': adv_probs[0],
-                'flipped': flipped,
-                'adv_top2_idx': adv_idxs[1],
-                'adv_top2_label': imagenet_classes[adv_idxs[1]],
-                'adv_top2_conf': adv_probs[1],
-                'adv_top3_idx': adv_idxs[2],
-                'adv_top3_label': imagenet_classes[adv_idxs[2]],
-                'adv_top3_conf': adv_probs[2]
+            replicate_dir = os.path.join(DATA_DIR, model_name,
+                                         f"sample{sample_idx}_{image_id}", "replicate0")
+            os.makedirs(replicate_dir, exist_ok=True)
+            images_dir = os.path.join(replicate_dir, "images")
+            os.makedirs(images_dir, exist_ok=True)
+
+            # Save logs
+            pd.DataFrame(result["log"]).to_csv(os.path.join(replicate_dir, "log.csv"), index=False)
+
+            # Save summary
+            success_metrics = None
+            if result["success_gen"] is not None:
+                success_row = result["log"][result["success_gen"]]
+                success_metrics = {
+                    "conf": success_row["pred_1_conf"],
+                    "l2": success_row["l2"],
+                    "nnr": success_row["nnr"],
+                    "predicted_label": success_row["pred_1_name"]
+                }
+
+            final_row = result["log"][-1]
+            summary = {
+                "model": model_name,
+                "sample_idx": sample_idx,
+                "image_file": img_path,
+                "true_label": {
+                    "name": target_label,
+                    "index": target_idx
+                },
+                "attack_success": result["success"],
+                "success_gen": result["success_gen"],
+                "success_metrics": success_metrics,
+                "final_metrics": {
+                    "conf": final_row["pred_1_conf"],
+                    "l2": final_row["l2"],
+                    "nnr": final_row["nnr"],
+                    "predicted_label": final_row["pred_1_name"]
+                },
+                "time_taken": result["time_taken"]
             }
-            log_rows.append(row)
-        except Exception:
+
+            with open(os.path.join(replicate_dir, "summary.json"), "w") as f:
+                json.dump(summary, f, indent=4)
+
+            # Save images
+            save_images(img_tensor, result["final_tensor"], images_dir, tag="adv")
+
+        except Exception as e:
+            print(f"Error processing {img_path} with {model_name}: {e}")
             continue
+
         outer_pbar.update(1)
 
 outer_pbar.close()
-
-# === SAVE LOG TO CSV ===
-df = pd.DataFrame(log_rows)
-df.to_csv(CSV_LOG, index=False)
-print(f"\n✅ Attack log saved to {CSV_LOG}")
+print("\n✅ Finished all attacks.")
