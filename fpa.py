@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -8,6 +9,9 @@ import urllib.request
 
 # === CONFIG ===
 IMAGE_PATH = 'sampled_1000_images_from5000/ILSVRC2012_val_00013542.JPEG'
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
 
 # === DEVICE SETUP ===
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,17 +39,46 @@ print(f"Image shape: {img_tensor.shape}")
 url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
 imagenet_classes = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
 
-# === RUN INFERENCE ===
+# === ORIGINAL PREDICTION ===
 with torch.no_grad():
     output = model(img_tensor)
-    probabilities = F.softmax(output, dim=1)
-    top5_probs, top5_idxs = probabilities.topk(5)
+    probs = F.softmax(output, dim=1)
+    top_probs, top_idxs = probs.topk(5)
 
-# === DISPLAY TOP-5 ===
-top5_probs = top5_probs.squeeze(0).tolist()
-top5_idxs = top5_idxs.squeeze(0).tolist()
+top_probs = top_probs.squeeze(0).tolist()
+top_idxs = top_idxs.squeeze(0).tolist()
+true_top1_idx = top_idxs[0]
+true_top1_label = imagenet_classes[true_top1_idx]
 
-print("\nTop-5 Predictions:")
-for rank, (idx, prob) in enumerate(zip(top5_idxs, top5_probs), start=1):
-    label = imagenet_classes[idx]
-    print(f"{rank}: {label} (class {idx}) - confidence: {prob:.4f}")
+print("\nOriginal Top-5 Predictions:")
+for rank, (idx, prob) in enumerate(zip(top_idxs, top_probs), start=1):
+    print(f"{rank}: {imagenet_classes[idx]} (class {idx}) - confidence: {prob:.4f}")
+
+# === ONE-PIXEL ATTACK: MODIFICATION ===
+modified = img_tensor.clone()
+_, _, h, w = modified.shape
+x = random.randint(0, w - 1)
+y = random.randint(0, h - 1)
+ch = random.randint(0, 2)
+modified[0, ch, y, x] = torch.rand(1).item()
+
+# === NEW PREDICTION ===
+with torch.no_grad():
+    output_adv = model(modified)
+    probs_adv = F.softmax(output_adv, dim=1)
+    top_probs_adv, top_idxs_adv = probs_adv.topk(5)
+
+top_probs_adv = top_probs_adv.squeeze(0).tolist()
+top_idxs_adv = top_idxs_adv.squeeze(0).tolist()
+adv_top1_idx = top_idxs_adv[0]
+adv_top1_label = imagenet_classes[adv_top1_idx]
+
+print("\nModified Top-5 Predictions:")
+for rank, (idx, prob) in enumerate(zip(top_idxs_adv, top_probs_adv), start=1):
+    print(f"{rank}: {imagenet_classes[idx]} (class {idx}) - confidence: {prob:.4f}")
+
+# === CHECK SUCCESS ===
+if adv_top1_idx != true_top1_idx:
+    print(f"\n✅ Attack succeeded: top-1 changed from {true_top1_label} to {adv_top1_label}")
+else:
+    print(f"\n❌ Attack failed: top-1 is still {true_top1_label}")
