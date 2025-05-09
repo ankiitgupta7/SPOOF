@@ -3,6 +3,7 @@ sample*
 data*
 *.csv
 logs*
+*txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

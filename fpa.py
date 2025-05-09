@@ -24,7 +24,7 @@ parser.add_argument('--sample', type=int, required=True,
 args = parser.parse_args()
 
 # === CONFIG ===
-IMAGE_FOLDER = 'sampled_1000_images_from5000'
+IMAGE_FOLDER = 'data/sampled_1000_images_from5000'
 MAX_ITER = 10000
 DATA_DIR = 'data_collected'
 
@@ -39,8 +39,22 @@ MODEL_CONFIGS = {
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # === LOAD IMAGENET CLASS LABELS ===
-url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-imagenet_classes = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
+LABELS_FILE = "imagenet_classes.txt"
+LABELS_URL = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+
+if os.path.isfile(LABELS_FILE):
+    with open(LABELS_FILE, 'r') as f:
+        imagenet_classes = [line.strip() for line in f.readlines()]
+else:
+    try:
+        print("Downloading ImageNet class labels...")
+        imagenet_classes = urllib.request.urlopen(LABELS_URL, timeout=10).read().decode("utf-8").splitlines()
+        with open(LABELS_FILE, 'w') as f:
+            f.write('\n'.join(imagenet_classes))
+        print("Saved ImageNet class labels to local file.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load ImageNet class labels: {e}")
+
 
 # === IMAGE TRANSFORM ===
 transform = T.Compose([
