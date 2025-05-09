@@ -20,22 +20,26 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = resnet50(weights=ResNet50_Weights.DEFAULT).to(device)
 model.eval()
 
-# === TRANSFORM ===
+# === TRANSFORMS ===
+mean = [0.485, 0.456, 0.406]
+std = [0.229, 0.224, 0.225]
+
 transform = T.Compose([
     T.Resize((224, 224)),
     T.ToTensor(),
-    T.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    T.Normalize(mean=mean, std=std)
 ])
+unnormalize = T.Normalize(
+    mean=[-m/s for m, s in zip(mean, std)],
+    std=[1/s for s in std]
+)
 
 # === LOAD IMAGE ===
 image = Image.open(IMAGE_PATH).convert('RGB')
 img_tensor = transform(image).unsqueeze(0).to(device)
 print(f"Image shape: {img_tensor.shape}")
 
-# === LOAD IMAGENET CLASS LABELS ===
+# === LOAD IMAGENET LABELS ===
 url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
 imagenet_classes = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
 
@@ -54,12 +58,13 @@ print("\nOriginal Top-5 Predictions:")
 for rank, (idx, prob) in enumerate(zip(top_idxs, top_probs), start=1):
     print(f"{rank}: {imagenet_classes[idx]} (class {idx}) - confidence: {prob:.4f}")
 
-# === ONE-PIXEL ATTACK: MODIFICATION ===
+# === ONE-PIXEL ATTACK ===
 modified = img_tensor.clone()
 _, _, h, w = modified.shape
 x = random.randint(0, w - 1)
 y = random.randint(0, h - 1)
 ch = random.randint(0, 2)
+original_val = modified[0, ch, y, x].item()
 modified[0, ch, y, x] = torch.rand(1).item()
 
 # === NEW PREDICTION ===
@@ -77,8 +82,21 @@ print("\nModified Top-5 Predictions:")
 for rank, (idx, prob) in enumerate(zip(top_idxs_adv, top_probs_adv), start=1):
     print(f"{rank}: {imagenet_classes[idx]} (class {idx}) - confidence: {prob:.4f}")
 
+# === PATCH-ONLY L2 AND NNR ===
+
+# 1. L2 on normalized values (patch only)
+l2 = (modified[0, ch, y, x] - img_tensor[0, ch, y, x]).pow(2).sqrt().item()
+
+# 2. NNR on unnormalized values (patch only)
+orig_unnorm = unnormalize(img_tensor.clone().squeeze()).clamp(0, 1)
+mod_unnorm = unnormalize(modified.clone().squeeze()).clamp(0, 1)
+nnr = (mod_unnorm[ch, y, x] - orig_unnorm[ch, y, x]).pow(2).sqrt().item()
+
 # === CHECK SUCCESS ===
 if adv_top1_idx != true_top1_idx:
     print(f"\n✅ Attack succeeded: top-1 changed from {true_top1_label} to {adv_top1_label}")
 else:
     print(f"\n❌ Attack failed: top-1 is still {true_top1_label}")
+
+print(f"\nL2 (patched, normalized): {l2:.6f}")
+print(f"NNR (patched, unnormalized): {nnr:.6f}")
